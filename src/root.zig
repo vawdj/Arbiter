@@ -17,7 +17,7 @@ pub const fen = @import("fen.zig");
 pub const movegen = @import("movegen.zig");
 pub const perft = @import("perft.zig");
 pub const evaluate = @import("eval.zig").evaluate;
-pub const search = @import("search.zig").search;
+pub const search = @import("search.zig");
 
 pub const SearchResult = @import("search.zig").SearchResult;
 
