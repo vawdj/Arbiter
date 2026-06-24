@@ -105,7 +105,25 @@ pub fn negamax(board: *Board, depth: u32, alpha_init: i32, beta: i32, state: *Se
     return alpha;
 }
 
-pub fn searchDepth(board: *Board, depth: u32, state: *SearchState) SearchResult {
+fn promoChar(m: Move) []const u8 {
+    return switch (m.flag) {
+        .promo_queen, .promo_queen_capture => "q",
+        .promo_rook, .promo_rook_capture => "r",
+        .promo_bishop, .promo_bishop_capture => "b",
+        .promo_knight, .promo_knight_capture => "n",
+        else => "",
+    };
+}
+
+const NullWriter = struct {
+    pub fn print(_: @This(), comptime fmt: []const u8, args: anytype) !void {
+        _ = fmt;
+        _ = args;
+    }
+    pub fn flush(_: @This()) !void {}
+};
+
+pub fn searchDepth(board: *Board, depth: u32, state: *SearchState, prev_best: ?Move) SearchResult {
     var best_move: ?Move = null;
     var best_score: i32 = -CHECKMATE_SCORE - 1;
     var alpha: i32 = -CHECKMATE_SCORE - 1;
@@ -116,6 +134,17 @@ pub fn searchDepth(board: *Board, depth: u32, state: *SearchState) SearchResult 
     const moves = moves_buf[0..generated.count];
     @memcpy(moves, generated.slice());
     std.sort.pdq(Move, moves, {}, moveLessThan);
+
+    if (prev_best) |pb| {
+        for (moves, 0..) |m, i| {
+            if (m.from == pb.from and m.to == pb.to and m.flag == pb.flag) {
+                const tmp = moves[0];
+                moves[0] = moves[i];
+                moves[i] = tmp;
+                break;
+            }
+        }
+    }
 
     for (moves) |move| {
         const undo = board.makeMove(move);
@@ -139,24 +168,6 @@ pub fn searchDepth(board: *Board, depth: u32, state: *SearchState) SearchResult 
     };
 }
 
-fn promoChar(m: Move) []const u8 {
-    return switch (m.flag) {
-        .promo_queen, .promo_queen_capture => "q",
-        .promo_rook, .promo_rook_capture => "r",
-        .promo_bishop, .promo_bishop_capture => "b",
-        .promo_knight, .promo_knight_capture => "n",
-        else => "",
-    };
-}
-
-const NullWriter = struct {
-    pub fn print(_: @This(), comptime fmt: []const u8, args: anytype) !void {
-        _ = fmt;
-        _ = args;
-    }
-    pub fn flush(_: @This()) !void {}
-};
-
 pub fn searchWithWriter(board: *Board, max_depth: u32, state: *SearchState, writer: anytype) SearchResult {
     var best = SearchResult{ .move = null, .score = 0, .depth = 0 };
 
@@ -172,24 +183,24 @@ pub fn searchWithWriter(board: *Board, max_depth: u32, state: *SearchState, writ
         null;
 
     var depth: u32 = 1;
+    var prev_best: ?Move = null;
     while (depth <= max_depth) : (depth += 1) {
-        const result = searchDepth(board, depth, state);
+        const result = searchDepth(board, depth, state, prev_best);
         if (state.stop.load(.acquire)) break;
         best = result;
+        prev_best = result.move;
 
         const now_ts: std.Io.Timestamp = std.Io.Clock.now(.awake, io);
         const elapsed_ms: u64 = @intCast(start_ts.durationTo(now_ts).toMilliseconds());
         const nps: u64 = if (elapsed_ms > 0) result.nodes * 1000 / elapsed_ms else result.nodes;
 
-        // SAFE CLAMPING TO PREVENT PANIC ON NEGATIVE CASTS
         if (result.score > CHECKMATE_SCORE - 500) {
-            const plies: u32 = @intCast(@max(0, CHECKMATE_SCORE - result.score));
+            const plies: u32 = @intCast(CHECKMATE_SCORE - result.score);
             writer.print("info depth {d} score mate {d} time {d} nodes {d} nps {d}", .{
                 result.depth, (plies + 1) / 2, elapsed_ms, result.nodes, nps,
             }) catch {};
         } else if (result.score < -(CHECKMATE_SCORE - 500)) {
-            const clamped = @max(result.score, -CHECKMATE_SCORE);
-            const plies: u32 = @intCast(CHECKMATE_SCORE + clamped);
+            const plies: u32 = @intCast(CHECKMATE_SCORE + result.score);
             writer.print("info depth {d} score mate -{d} time {d} nodes {d} nps {d}", .{
                 result.depth, (plies + 1) / 2, elapsed_ms, result.nodes, nps,
             }) catch {};
