@@ -16,7 +16,7 @@ pub fn run(stdin: anytype, stdout: anytype) !void {
     var board = chess.fen.parse(chess.fen.start_position) catch unreachable;
 
     try stdout.writeAll("id name Arbiter\n");
-    try stdout.writeAll("id author YourName\n");
+    try stdout.writeAll("id author Jayden_Vawdrey\n");
     try stdout.writeAll("uciok\n");
     try stdout.flush();
 
@@ -41,15 +41,16 @@ pub fn run(stdin: anytype, stdout: anytype) !void {
             } else chess.search.SearchState.init();
 
             const max_depth = params.depth orelse 100;
-            const result = chess.search.searchWithState(&board, max_depth, &state);
+
+            // CHANGED: record the clock before search and pass stdout so
+            // searchWithWriter can flush one info line per depth in real time.
+            // The old manual `info depth … score cp …` print is now gone;
+            // searchWithWriter handles it with nodes/time/nps/pv included.
+            const result = chess.search.searchWithWriter(&board, max_depth, &state, stdout);
 
             if (result.move) |m| {
                 const from = m.from.toString();
                 const to = m.to.toString();
-                try stdout.print("info depth {d} score cp {d}\n", .{
-                    result.depth,
-                    result.score,
-                });
                 try stdout.print("bestmove {s}{s}{s}\n", .{
                     from,
                     to,
@@ -62,9 +63,10 @@ pub fn run(stdin: anytype, stdout: anytype) !void {
         } else if (std.mem.eql(u8, cmd, "quit")) {
             break;
         }
-        // unknown commands silently ignored — handles setoption, register, etc.
     }
 }
+
+// ── helpers (all unchanged) ──────────────────────────────────────────────────
 
 fn parsePosition(cmd: []const u8) !chess.Board {
     if (cmd.len < 9) return error.InvalidPosition;
@@ -87,7 +89,7 @@ fn parsePosition(cmd: []const u8) !chess.Board {
     const trimmed_rest = std.mem.trim(u8, rest, " ");
     if (std.mem.startsWith(u8, trimmed_rest, "moves")) {
         var it = std.mem.splitScalar(u8, trimmed_rest, ' ');
-        _ = it.next(); // skip "moves"
+        _ = it.next();
         while (it.next()) |move_str| {
             const m = parseMoveStr(move_str, &board) orelse continue;
             _ = board.makeMove(m);
@@ -134,7 +136,7 @@ fn parseMoveStr(s: []const u8, board: *chess.Board) ?chess.Move {
 fn parseGo(cmd: []const u8) GoParams {
     var params = GoParams{};
     var it = std.mem.splitScalar(u8, cmd, ' ');
-    _ = it.next(); // skip "go"
+    _ = it.next();
 
     while (it.next()) |token| {
         if (std.mem.eql(u8, token, "wtime")) {

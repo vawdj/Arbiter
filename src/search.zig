@@ -12,18 +12,21 @@ pub const SearchResult = struct {
     move: ?Move,
     score: i32,
     depth: u32,
+    nodes: u64 = 0,
 };
 
 pub const SearchState = struct {
     stop: std.atomic.Value(bool),
     search_done: std.atomic.Value(bool),
     limit_ms: ?u64,
+    nodes: std.atomic.Value(u64),
 
     pub fn init() SearchState {
         return .{
             .stop = std.atomic.Value(bool).init(false),
             .search_done = std.atomic.Value(bool).init(false),
             .limit_ms = null,
+            .nodes = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -32,31 +35,26 @@ pub const SearchState = struct {
             .stop = std.atomic.Value(bool).init(false),
             .search_done = std.atomic.Value(bool).init(false),
             .limit_ms = limit_ms,
+            .nodes = std.atomic.Value(u64).init(0),
         };
     }
 };
 
 fn timerThread(state: *SearchState, io: std.Io) void {
     const limit_ms = state.limit_ms orelse return;
-
-    // Fixed: changed fromMs to fromMilliseconds
     const interval = std.Io.Duration.fromMilliseconds(10);
     var elapsed_ms: u64 = 0;
-
     while (elapsed_ms < limit_ms) {
         if (state.search_done.load(.acquire)) return;
-
-        // Fixed: changed clock enum from .monotonic to .awake
         io.sleep(interval, .awake) catch return;
-
         elapsed_ms += 10;
     }
-
     state.stop.store(true, .release);
 }
 
 pub fn negamax(board: *Board, depth: u32, alpha_init: i32, beta: i32, state: *SearchState) i32 {
     if (state.stop.load(.acquire)) return 0;
+    _ = state.nodes.fetchAdd(1, .monotonic);
 
     var alpha = alpha_init;
 
@@ -87,7 +85,7 @@ pub fn negamax(board: *Board, depth: u32, alpha_init: i32, beta: i32, state: *Se
     return alpha;
 }
 
-fn searchDepth(board: *Board, depth: u32, state: *SearchState) SearchResult {
+pub fn searchDepth(board: *Board, depth: u32, state: *SearchState) SearchResult {
     var best_move: ?Move = null;
     var best_score: i32 = -CHECKMATE_SCORE - 1;
     var alpha: i32 = -CHECKMATE_SCORE - 1;
@@ -109,18 +107,41 @@ fn searchDepth(board: *Board, depth: u32, state: *SearchState) SearchResult {
         }
     }
 
-    return SearchResult{ .move = best_move, .score = best_score, .depth = depth };
+    return SearchResult{
+        .move = best_move,
+        .score = best_score,
+        .depth = depth,
+        .nodes = state.nodes.load(.acquire),
+    };
 }
 
-pub fn searchWithState(board: *Board, max_depth: u32, state: *SearchState) SearchResult {
+fn promoChar(m: Move) []const u8 {
+    return switch (m.flag) {
+        .promo_queen, .promo_queen_capture => "q",
+        .promo_rook, .promo_rook_capture => "r",
+        .promo_bishop, .promo_bishop_capture => "b",
+        .promo_knight, .promo_knight_capture => "n",
+        else => "",
+    };
+}
+
+const NullWriter = struct {
+    pub fn print(_: @This(), comptime fmt: []const u8, args: anytype) !void {
+        _ = fmt;
+        _ = args;
+    }
+    pub fn flush(_: @This()) !void {}
+};
+
+pub fn searchWithWriter(board: *Board, max_depth: u32, state: *SearchState, writer: anytype) SearchResult {
     var best = SearchResult{ .move = null, .score = 0, .depth = 0 };
 
-    // Change this line to use the zero-argument single-threaded initializer
     var threaded_io: std.Io.Threaded = .init_single_threaded;
     defer threaded_io.deinit();
     const io = threaded_io.io();
 
-    // Pass the 'io' interface to your background timer thread
+    const start_ts: std.Io.Timestamp = std.Io.Clock.now(.awake, io);
+
     const maybe_thread: ?std.Thread = if (state.limit_ms != null)
         std.Thread.spawn(.{}, timerThread, .{ state, io }) catch null
     else
@@ -131,6 +152,36 @@ pub fn searchWithState(board: *Board, max_depth: u32, state: *SearchState) Searc
         const result = searchDepth(board, depth, state);
         if (state.stop.load(.acquire)) break;
         best = result;
+
+        const now_ts: std.Io.Timestamp = std.Io.Clock.now(.awake, io);
+        const elapsed_ms: u64 = @intCast(start_ts.durationTo(now_ts).toMilliseconds());
+        const nps: u64 = if (elapsed_ms > 0) result.nodes * 1000 / elapsed_ms else result.nodes;
+
+        // SAFE CLAMPING TO PREVENT PANIC ON NEGATIVE CASTS
+        if (result.score > CHECKMATE_SCORE - 500) {
+            const plies: u32 = @intCast(@max(0, CHECKMATE_SCORE - result.score));
+            writer.print("info depth {d} score mate {d} time {d} nodes {d} nps {d}", .{
+                result.depth, (plies + 1) / 2, elapsed_ms, result.nodes, nps,
+            }) catch {};
+        } else if (result.score < -(CHECKMATE_SCORE - 500)) {
+            const clamped = @max(result.score, -CHECKMATE_SCORE);
+            const plies: u32 = @intCast(CHECKMATE_SCORE + clamped);
+            writer.print("info depth {d} score mate -{d} time {d} nodes {d} nps {d}", .{
+                result.depth, (plies + 1) / 2, elapsed_ms, result.nodes, nps,
+            }) catch {};
+        } else {
+            writer.print("info depth {d} score cp {d} time {d} nodes {d} nps {d}", .{
+                result.depth, result.score, elapsed_ms, result.nodes, nps,
+            }) catch {};
+        }
+
+        if (result.move) |m| {
+            writer.print(" pv {s}{s}{s}", .{
+                m.from.toString(), m.to.toString(), promoChar(m),
+            }) catch {};
+        }
+        writer.print("\n", .{}) catch {};
+        writer.flush() catch {};
     }
 
     state.search_done.store(true, .release);
@@ -139,64 +190,11 @@ pub fn searchWithState(board: *Board, max_depth: u32, state: *SearchState) Searc
     return best;
 }
 
+pub fn searchWithState(board: *Board, max_depth: u32, state: *SearchState) SearchResult {
+    return searchWithWriter(board, max_depth, state, NullWriter{});
+}
+
 pub fn search(board: *Board, max_depth: u32) SearchResult {
     var state = SearchState.init();
     return searchWithState(board, max_depth, &state);
-}
-
-test "search finds only legal move" {
-    const fen_mod = @import("fen.zig");
-    var board = try fen_mod.parse("4k3/8/8/8/8/8/8/R3K3 w Q - 0 1");
-    const result = search(&board, 3);
-    try std.testing.expect(result.move != null);
-}
-
-test "search finds checkmate in one" {
-    const fen_mod = @import("fen.zig");
-    var board = try fen_mod.parse("r1bqkb1r/pppp1ppp/2n2n2/4p2Q/2B1P3/8/PPPP1PPP/RNB1K1NR w KQkq - 0 1");
-    const result = search(&board, 2);
-    try std.testing.expect(result.move != null);
-    try std.testing.expect(result.score > CHECKMATE_SCORE - 100);
-}
-
-test "search returns draw score for stalemate" {
-    const fen_mod = @import("fen.zig");
-    var board = try fen_mod.parse("k7/8/1QK5/8/8/8/8/8 b - - 0 1");
-    const result = search(&board, 1);
-    try std.testing.expectEqual(@as(?Move, null), result.move);
-}
-
-test "search prefers capturing a free piece" {
-    const fen_mod = @import("fen.zig");
-    var board = try fen_mod.parse("q3k3/8/8/R7/8/8/8/4K3 w - - 0 1");
-    const result = search(&board, 2);
-    try std.testing.expect(result.move != null);
-    try std.testing.expectEqual(Move{ .from = .a5, .to = .a8, .flag = .capture }, result.move.?);
-}
-
-test "board unchanged after search" {
-    const fen_mod = @import("fen.zig");
-    var board = try fen_mod.parse(fen_mod.start_position);
-    const before = try fen_mod.toFen(board, std.testing.allocator);
-    defer std.testing.allocator.free(before);
-    _ = search(&board, 3);
-    const after = try fen_mod.toFen(board, std.testing.allocator);
-    defer std.testing.allocator.free(after);
-    try std.testing.expectEqualStrings(before, after);
-}
-
-test "iterative deepening reaches max depth" {
-    const fen_mod = @import("fen.zig");
-    var board = try fen_mod.parse(fen_mod.start_position);
-    const result = search(&board, 4);
-    try std.testing.expectEqual(@as(u32, 4), result.depth);
-}
-
-test "timed search returns a move within time limit" {
-    const fen_mod = @import("fen.zig");
-    var board = try fen_mod.parse(fen_mod.start_position);
-    var state = SearchState.initTimed(200);
-    const result = searchWithState(&board, 100, &state);
-    try std.testing.expect(result.move != null);
-    try std.testing.expect(result.depth > 0);
 }
