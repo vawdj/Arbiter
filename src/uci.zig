@@ -1,9 +1,19 @@
 const std = @import("std");
 const chess = @import("Arbiter");
 
+const GoParams = struct {
+    wtime: ?i64 = null,
+    btime: ?i64 = null,
+    winc: i64 = 0,
+    binc: i64 = 0,
+    movestogo: ?u32 = null,
+    movetime: ?i64 = null,
+    depth: ?u32 = null,
+    infinite: bool = false,
+};
+
 pub fn run(stdin: anytype, stdout: anytype) !void {
     var board = chess.fen.parse(chess.fen.start_position) catch unreachable;
-    var state = chess.search.SearchState{};
 
     try stdout.writeAll("id name Arbiter\n");
     try stdout.writeAll("id author YourName\n");
@@ -20,12 +30,17 @@ pub fn run(stdin: anytype, stdout: anytype) !void {
             try stdout.flush();
         } else if (std.mem.eql(u8, cmd, "ucinewgame")) {
             board = chess.fen.parse(chess.fen.start_position) catch unreachable;
-            state = chess.search.SearchState{};
         } else if (std.mem.startsWith(u8, cmd, "position")) {
             board = parsePosition(cmd) catch continue;
         } else if (std.mem.startsWith(u8, cmd, "go")) {
-            state = chess.search.SearchState{};
-            const max_depth = parseGo(cmd);
+            const params = parseGo(cmd);
+
+            var state = if (shouldUseTimer(params)) blk: {
+                const budget = calculateMoveTime(params, board.side_to_move);
+                break :blk chess.search.SearchState.initTimed(@intCast(@max(1, budget)));
+            } else chess.search.SearchState.init();
+
+            const max_depth = params.depth orelse 100;
             const result = chess.search.searchWithState(&board, max_depth, &state);
 
             if (result.move) |m| {
@@ -44,22 +59,17 @@ pub fn run(stdin: anytype, stdout: anytype) !void {
                 try stdout.writeAll("bestmove 0000\n");
             }
             try stdout.flush();
-        } else if (std.mem.eql(u8, cmd, "stop")) {
-            state.stop = true;
         } else if (std.mem.eql(u8, cmd, "quit")) {
             break;
         }
+        // unknown commands silently ignored — handles setoption, register, etc.
     }
 }
 
 fn parsePosition(cmd: []const u8) !chess.Board {
-    // cmd is "position startpos" or "position startpos moves e2e4 ..."
-    // or "position fen <fenstring>" or "position fen <fenstring> moves ..."
-    var board: chess.Board = undefined;
-
-    // skip "position "
     if (cmd.len < 9) return error.InvalidPosition;
     var rest = cmd[9..];
+    var board: chess.Board = undefined;
 
     if (std.mem.startsWith(u8, rest, "startpos")) {
         board = chess.fen.parse(chess.fen.start_position) catch unreachable;
@@ -74,7 +84,6 @@ fn parsePosition(cmd: []const u8) !chess.Board {
         return error.InvalidPosition;
     }
 
-    // apply move list if present
     const trimmed_rest = std.mem.trim(u8, rest, " ");
     if (std.mem.startsWith(u8, trimmed_rest, "moves")) {
         var it = std.mem.splitScalar(u8, trimmed_rest, ' ');
@@ -122,16 +131,54 @@ fn parseMoveStr(s: []const u8, board: *chess.Board) ?chess.Move {
     return null;
 }
 
-fn parseGo(cmd: []const u8) u32 {
-    if (std.mem.indexOf(u8, cmd, "depth ")) |i| {
-        const rest = std.mem.trim(u8, cmd[i + 6 ..], " ");
-        var it = std.mem.splitScalar(u8, rest, ' ');
-        if (it.next()) |n| {
-            return std.fmt.parseInt(u32, n, 10) catch 6;
+fn parseGo(cmd: []const u8) GoParams {
+    var params = GoParams{};
+    var it = std.mem.splitScalar(u8, cmd, ' ');
+    _ = it.next(); // skip "go"
+
+    while (it.next()) |token| {
+        if (std.mem.eql(u8, token, "wtime")) {
+            if (it.next()) |v| params.wtime = std.fmt.parseInt(i64, v, 10) catch null;
+        } else if (std.mem.eql(u8, token, "btime")) {
+            if (it.next()) |v| params.btime = std.fmt.parseInt(i64, v, 10) catch null;
+        } else if (std.mem.eql(u8, token, "winc")) {
+            if (it.next()) |v| params.winc = std.fmt.parseInt(i64, v, 10) catch 0;
+        } else if (std.mem.eql(u8, token, "binc")) {
+            if (it.next()) |v| params.binc = std.fmt.parseInt(i64, v, 10) catch 0;
+        } else if (std.mem.eql(u8, token, "movestogo")) {
+            if (it.next()) |v| params.movestogo = std.fmt.parseInt(u32, v, 10) catch null;
+        } else if (std.mem.eql(u8, token, "movetime")) {
+            if (it.next()) |v| params.movetime = std.fmt.parseInt(i64, v, 10) catch null;
+        } else if (std.mem.eql(u8, token, "depth")) {
+            if (it.next()) |v| params.depth = std.fmt.parseInt(u32, v, 10) catch null;
+        } else if (std.mem.eql(u8, token, "infinite")) {
+            params.infinite = true;
         }
     }
-    // movetime/wtime/btime — fixed depth for now, replace with timer later
-    return 6;
+
+    return params;
+}
+
+fn shouldUseTimer(params: GoParams) bool {
+    if (params.infinite) return false;
+    if (params.depth != null) return false;
+    return params.movetime != null or params.wtime != null or params.btime != null;
+}
+
+fn calculateMoveTime(params: GoParams, color: chess.Color) i64 {
+    if (params.movetime) |mt| return mt;
+
+    const my_time = if (color == .white) params.wtime orelse return 1000 else params.btime orelse return 1000;
+    const my_inc = if (color == .white) params.winc else params.binc;
+
+    if (params.movestogo) |mtg| {
+        const moves_left: i64 = @max(1, @as(i64, @intCast(mtg)));
+        return @divTrunc(my_time, moves_left) + @divTrunc(my_inc, 2);
+    }
+
+    const budget = @divTrunc(my_time, 30) + @divTrunc(my_inc, 2);
+    const capped = @min(budget, @divTrunc(my_time, 2));
+    return @max(1, capped - 50);
 }
 
 fn promotionSuffix(m: chess.Move) []const u8 {
