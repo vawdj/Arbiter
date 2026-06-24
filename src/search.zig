@@ -8,6 +8,22 @@ const eval = @import("eval.zig");
 pub const CHECKMATE_SCORE: i32 = 100_000;
 pub const DRAW_SCORE: i32 = 0;
 
+fn moveScore(m: Move) i32 {
+    return switch (m.flag) {
+        .promo_queen_capture => 6,
+        .capture => 5,
+        .promo_rook_capture => 4,
+        .promo_bishop_capture, .promo_knight_capture => 3,
+        .promo_queen => 2,
+        .promo_rook, .promo_bishop, .promo_knight => 1,
+        else => 0,
+    };
+}
+
+fn moveLessThan(_: void, a: Move, b: Move) bool {
+    return moveScore(a) > moveScore(b); // descending: best first
+}
+
 pub const SearchResult = struct {
     move: ?Move,
     score: i32,
@@ -62,9 +78,13 @@ pub fn negamax(board: *Board, depth: u32, alpha_init: i32, beta: i32, state: *Se
         return eval.evaluate(board.*);
     }
 
-    var moves = movegen.generateLegalMoves(board);
+    const generated = movegen.generateLegalMoves(board);
+    var moves_buf: [256]Move = undefined;
+    const moves = moves_buf[0..generated.count];
+    @memcpy(moves, generated.slice());
+    std.sort.pdq(Move, moves, {}, moveLessThan);
 
-    if (moves.count == 0) {
+    if (moves.len == 0) {
         if (movegen.isInCheck(board.*, board.side_to_move)) {
             return -(CHECKMATE_SCORE - @as(i32, @intCast(depth)));
         } else {
@@ -72,7 +92,7 @@ pub fn negamax(board: *Board, depth: u32, alpha_init: i32, beta: i32, state: *Se
         }
     }
 
-    for (moves.slice()) |move| {
+    for (moves) |move| {
         const undo = board.makeMove(move);
         const score = -negamax(board, depth - 1, -beta, -alpha, state);
         board.unmakeMove(move, undo);
@@ -91,9 +111,13 @@ pub fn searchDepth(board: *Board, depth: u32, state: *SearchState) SearchResult 
     var alpha: i32 = -CHECKMATE_SCORE - 1;
     const beta: i32 = CHECKMATE_SCORE + 1;
 
-    var moves = movegen.generateLegalMoves(board);
+    const generated = movegen.generateLegalMoves(board);
+    var moves_buf: [256]Move = undefined;
+    const moves = moves_buf[0..generated.count];
+    @memcpy(moves, generated.slice());
+    std.sort.pdq(Move, moves, {}, moveLessThan);
 
-    for (moves.slice()) |move| {
+    for (moves) |move| {
         const undo = board.makeMove(move);
         const score = -negamax(board, depth - 1, -beta, -alpha, state);
         board.unmakeMove(move, undo);
